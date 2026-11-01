@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import "@google/model-viewer";
 import {
 Upload,
 ImagePlus,
@@ -26,6 +27,8 @@ const drawingRef = useRef(false);
 const historyRef = useRef([]);
 const historyIndexRef = useRef(-1);
 const previewRef = useRef(null);
+const modelViewerRef = useRef(null);
+const modelUrlRef = useRef(null);
 
 const [activeTab, setActiveTab] = useState("upload");
 const [file, setFile] = useState(null);
@@ -33,8 +36,9 @@ const [preview, setPreview] = useState(null);
 const [dragging, setDragging] = useState(false);
 const [tool, setTool] = useState("pencil");
 const [brushSize, setBrushSize] = useState(4);
-const [historyVersion, setHistoryVersion] = useState(0);
+const [, setHistoryVersion] = useState(0);
 const [isGenerating, setIsGenerating] = useState(false);
+const [generatedModelUrl, setGeneratedModelUrl] = useState(null);
 
 // Initialize drawing canvas
 useEffect(() => {
@@ -66,6 +70,16 @@ if (previewRef.current) {
 URL.revokeObjectURL(previewRef.current);
 }
 };
+}, []);
+
+ // Clean up the generated GLB URL when this component unmounts.
+useEffect(() => {
+  return () => {
+    if (modelUrlRef.current) {
+      URL.revokeObjectURL(modelUrlRef.current);
+      modelUrlRef.current = null;
+    }
+  };
 }, []);
 
 // Save drawing history
@@ -300,38 +314,126 @@ return new Promise((resolve) => {
 
 };
 
-// Generate model placeholder
+// Generate a 3D model and store its GLB URL for the viewer.
 const generateModel = async () => {
-  const sketchFile = await getSketchFile();
-
-  if (!sketchFile) {
-    alert("Please provide a valid sketch.");
-    return;
-  }
-
-  const formData = new FormData();
-  formData.append("file", sketchFile);
-
   try {
+    const sketchFile = await getSketchFile();
+
+    if (!sketchFile) {
+      alert("Please upload an image or draw a sketch first.");
+      return;
+    }
+
     setIsGenerating(true);
 
-    const response = await api.post("/generate", formData);
+    const formData = new FormData();
+    formData.append("file", sketchFile);
 
-    console.log("Backend response:", response.data);
+    const response = await api.post("/generate", formData, {
+      responseType: "blob",
+      timeout: 660000,
+    });
 
-    alert("Sketch uploaded successfully!");
-  } catch (error) {
-    console.error("Upload error:", error);
+    const contentType = (response.headers?.["content-type"] || "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
 
-    alert(
-      error.response?.data?.detail ||
-      "Unable to upload sketch. Please try again."
+    if (
+      contentType !== "model/gltf-binary" &&
+      contentType !== "application/octet-stream"
+    ) {
+      const errorText = response.data instanceof Blob
+        ? await response.data.text()
+        : String(response.data || "");
+
+      let errorMessage = "The server did not return a GLB 3D model.";
+
+      try {
+        const errorData = JSON.parse(errorText);
+        errorMessage = errorData.detail || errorData.message || errorMessage;
+      } catch {
+        if (errorText) errorMessage = errorText;
+      }
+
+      throw new Error(errorMessage);
+    }
+
+    if (!(response.data instanceof Blob) || response.data.size === 0) {
+      throw new Error("The generated 3D model is empty or invalid.");
+    }
+
+    // A GLB file starts with the four-character signature "glTF".
+    const signature = new TextDecoder().decode(
+      await response.data.slice(0, 4).arrayBuffer()
     );
+
+    if (signature !== "glTF") {
+      throw new Error("The server response is not a valid GLB file.");
+    }
+
+    if (modelUrlRef.current) {
+      URL.revokeObjectURL(modelUrlRef.current);
+    }
+
+    const newModelUrl = URL.createObjectURL(response.data);
+    modelUrlRef.current = newModelUrl;
+    setGeneratedModelUrl(newModelUrl);
+
+    console.log("3D model generated successfully!");
+    console.log("GLB size:", response.data.size, "bytes");
+  } catch (error) {
+    console.error("3D generation failed:", error);
+
+    let message =
+      error.response?.data?.detail ||
+      error.message ||
+      "Unable to generate the 3D model.";
+
+    if (error.response?.data instanceof Blob) {
+      try {
+        const errorText = await error.response.data.text();
+        const errorData = JSON.parse(errorText);
+        message = errorData.detail || errorData.message || message;
+      } catch {
+        // Keep the original error message.
+      }
+    }
+
+    alert(message);
   } finally {
     setIsGenerating(false);
   }
 };
 
+// Download the generated GLB file.
+const downloadModel = () => {
+  if (!generatedModelUrl) return;
+
+  const link = document.createElement("a");
+  link.href = generatedModelUrl;
+  link.download = "sketch2shape-model.glb";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+};
+
+// Reset the model viewer camera.
+const resetModelView = () => {
+  modelViewerRef.current?.resetTurntableRotation?.();
+  modelViewerRef.current?.jumpCameraToGoal?.();
+};
+
+// Open the model viewer in fullscreen.
+const openModelFullscreen = () => {
+  const viewer = modelViewerRef.current;
+
+  if (viewer?.requestFullscreen) {
+    viewer.requestFullscreen().catch((error) => {
+      console.error("Could not open fullscreen:", error);
+    });
+  }
+};
 const canGenerate =
 activeTab === "upload" ? Boolean(file) : true;
 
@@ -656,7 +758,7 @@ return ( <div className="relative min-h-screen overflow-hidden bg-[#080812] text
             <Sparkles size={19} />
           )}
 
-          {isGenerating ? "Preparing Sketch..." : "Generate 3D Model"}
+          {isGenerating ? "Generating 3D Model..." : "Generate 3D Model"}
 
           {!isGenerating && <ArrowRight size={18} />}
         </button>
@@ -694,10 +796,8 @@ return ( <div className="relative min-h-screen overflow-hidden bg-[#080812] text
           </span>
         </div>
 
-        {/* 3D Canvas Placeholder */}
+        {/* 3D Model Viewer */}
         <div className="relative mt-5 flex min-h-90 flex-1 items-center justify-center overflow-hidden rounded-2xl border border-white/[0.07] bg-[radial-gradient(ellipse_at_center,#202143_0%,#111426_50%,#090b18_100%)] sm:min-h-110">
-
-          {/* Grid */}
           <div
             className="pointer-events-none absolute inset-0 opacity-[0.12]"
             style={{
@@ -709,59 +809,82 @@ return ( <div className="relative min-h-screen overflow-hidden bg-[#080812] text
             }}
           />
 
-          {/* Center glow */}
           <div className="pointer-events-none absolute h-56 w-56 rounded-full bg-violet-600/20 blur-[90px]" />
 
-          {/* Empty state */}
-          <div className="relative z-10 px-5 text-center">
+          {generatedModelUrl ? (
+            <model-viewer
+              ref={modelViewerRef}
+              src={generatedModelUrl}
+              alt="Generated 3D model"
+              camera-controls
+              auto-rotate
+              shadow-intensity="1"
+              exposure="1"
+              interaction-prompt="auto"
+              style={{
+                width: "100%",
+                height: "100%",
+                minHeight: "440px",
+                backgroundColor: "transparent",
+                position: "relative",
+                zIndex: 1,
+              }}
+            />
+          ) : (
+            <div className="relative z-10 px-5 text-center">
+              <div className="relative mx-auto mb-7 grid h-28 w-28 place-items-center rounded-[30px] border border-violet-400/20 bg-linear-to-br from-violet-500/15 to-blue-500/10 text-violet-300 shadow-[0_0_50px_rgba(124,58,237,0.15)]">
+                <Cuboid size={55} strokeWidth={1.1} />
+                <div className="absolute -inset-3 rounded-full border border-violet-400/10" />
+              </div>
 
-            <div className="relative mx-auto mb-7 grid h-28 w-28 place-items-center rounded-[30px] border border-violet-400/20 bg-linear-to-br from-violet-500/15 to-blue-500/10 text-violet-300 shadow-[0_0_50px_rgba(124,58,237,0.15)]">
-              <Cuboid size={55} strokeWidth={1.1} />
+              <h4 className="text-base font-semibold sm:text-lg">
+                {isGenerating ? "Creating your 3D model..." : "Your 3D model awaits"}
+              </h4>
 
-              <div className="absolute -inset-3 rounded-full border border-violet-400/10" />
+              <p className="mx-auto mt-3 max-w-xs text-xs leading-6 text-gray-400">
+                {isGenerating
+                  ? "Your sketch is being processed. This may take a few minutes."
+                  : "Upload or draw a sketch to generate your first 3D masterpiece."}
+              </p>
+
+              {!isGenerating && (
+                <div className="mt-6 flex flex-wrap justify-center gap-2">
+                  {["GLB", "3D ASSET", "AI GENERATED"].map((tag) => (
+                    <span
+                      key={tag}
+                      className="rounded-lg border border-violet-400/15 bg-violet-500/10 px-3 py-2 text-[9px] tracking-wider text-violet-300"
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
+          )}
 
-            <h4 className="text-base font-semibold sm:text-lg">
-              Your 3D model awaits
-            </h4>
+          {generatedModelUrl && (
+            <div className="absolute right-3 top-3 z-20 flex gap-2">
+              <button
+                type="button"
+                onClick={resetModelView}
+                title="Reset view"
+                className="grid h-10 w-10 place-items-center rounded-xl border border-white/10 bg-black/50 text-gray-200 transition hover:bg-violet-500/30"
+              >
+                <RotateCcw size={17} />
+              </button>
 
-            <p className="mx-auto mt-3 max-w-xs text-xs leading-6 text-gray-400">
-              Upload or draw a sketch to generate your first 3D masterpiece.
-            </p>
-
-            <div className="mt-6 flex flex-wrap justify-center gap-2">
-              {["GLB", "3D ASSET", "AI GENERATED"].map((tag) => (
-                <span
-                  key={tag}
-                  className="rounded-lg border border-violet-400/15 bg-violet-500/10 px-3 py-2 text-[9px] tracking-wider text-violet-300"
-                >
-                  {tag}
-                </span>
-              ))}
+              <button
+                type="button"
+                onClick={openModelFullscreen}
+                title="Fullscreen"
+                className="grid h-10 w-10 place-items-center rounded-xl border border-white/10 bg-black/50 text-gray-200 transition hover:bg-violet-500/30"
+              >
+                <Maximize2 size={17} />
+              </button>
             </div>
-          </div>
+          )}
 
-          {/* Viewer controls placeholder */}
-          <div className="absolute right-3 top-3 flex gap-2">
-            <button
-              title="Reset view"
-              disabled
-              className="grid h-10 w-10 place-items-center rounded-xl border border-white/10 bg-black/30 text-gray-400 opacity-50"
-            >
-              <RotateCcw size={17} />
-            </button>
-
-            <button
-              title="Fullscreen"
-              disabled
-              className="grid h-10 w-10 place-items-center rounded-xl border border-white/10 bg-black/30 text-gray-400 opacity-50"
-            >
-              <Maximize2 size={17} />
-            </button>
-          </div>
-
-          {/* Canvas footer */}
-          <div className="absolute bottom-4 left-4 right-4 flex flex-wrap justify-between gap-2 text-[8px] tracking-wider text-gray-500 sm:text-[9px]">
+          <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-10 flex flex-wrap justify-between gap-2 text-[8px] tracking-wider text-gray-500 sm:text-[9px]">
             <span>DRAG TO ROTATE</span>
             <span>SCROLL TO ZOOM</span>
           </div>
@@ -769,15 +892,20 @@ return ( <div className="relative min-h-screen overflow-hidden bg-[#080812] text
 
         {/* Viewer footer */}
         <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
-
           <div className="flex items-center gap-2 text-xs text-gray-400">
-            <span className="h-2 w-2 rounded-full bg-gray-500" />
-            Waiting for generation
+            <span
+              className={`h-2 w-2 rounded-full ${
+                generatedModelUrl ? "bg-emerald-400" : "bg-gray-500"
+              }`}
+            />
+            {generatedModelUrl ? "3D model ready" : "Waiting for generation"}
           </div>
 
           <button
-            disabled
-            className="flex min-h-10 items-center justify-center gap-2 rounded-xl border border-violet-400/20 bg-violet-500/10 px-4 text-xs font-medium text-violet-300 opacity-50"
+            type="button"
+            onClick={downloadModel}
+            disabled={!generatedModelUrl}
+            className="flex min-h-10 items-center justify-center gap-2 rounded-xl border border-violet-400/20 bg-violet-500/10 px-4 text-xs font-medium text-violet-300 transition hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <Download size={16} />
             Download GLB
